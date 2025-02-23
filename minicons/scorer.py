@@ -1515,7 +1515,9 @@ class IncrementalLMScorer(LMScorer):
         if self.tokenizer.chat_template is None:
             encoded = self.tokenizer(text, return_tensors="pt", padding=True)
         else:
-            encoded = self.tokenizer(text, return_tensors="pt", padding=True, add_special_tokens=False)
+            encoded = self.tokenizer(
+                text, return_tensors="pt", padding=True, add_special_tokens=False
+            )
         if "token_type_ids" in encoded.keys():
             encoded.pop("token_type_ids")
 
@@ -1547,9 +1549,9 @@ class IncrementalLMScorer(LMScorer):
         self,
         preamble: Union[str, List[str]],
         stimuli: Union[str, List[str]],
-        separator: Union[str, List[str]]=" ",
-        bos_token: bool=False,
-        eos_token: bool=False,
+        separator: Union[str, List[str]] = " ",
+        bos_token: bool = False,
+        eos_token: bool = False,
     ) -> Tuple:
         """
         Prepares a batch of input text into a format fit to run LM
@@ -1583,12 +1585,14 @@ class IncrementalLMScorer(LMScorer):
                 if isinstance(preamble, str)
                 else [p + separator + s for p, s in list(zip(preamble, stimuli))]
             )
-            
+
         elif isinstance(separator, list):
             assert not isinstance(preamble, str)
             assert len(preamble) == len(separator) == len(stimuli)
-            
-            sentences = [p + sep + s for p, sep, s in list(zip(preamble, separator, stimuli))]
+
+            sentences = [
+                p + sep + s for p, sep, s in list(zip(preamble, separator, stimuli))
+            ]
 
         return self.encode(sentences, bos_token, eos_token), preamble_lens
 
@@ -2136,7 +2140,11 @@ class Seq2SeqScorer(LMScorer):
         else:
             self.model = model
 
-        # define CLS and SEP tokens
+        # define CLS and SEP tokens (and mask if model is type is T5)
+        if self.model.config.model_type == "t5":
+            # set mask token to '<extra_id_0>'
+            self.tokenizer.mask_token = self.tokenizer.additional_special_tokens[0]
+
         if self.tokenizer.pad_token is None:
             if tokenizer is not None:
                 warnings.warn(
@@ -2221,6 +2229,87 @@ class Seq2SeqScorer(LMScorer):
         offset = [0] * len(prefix_encoded["input_ids"])  # this will be ignored anyway
 
         return prefix_encoded, stimuli_encoded, offset
+
+    def cloze_distribution(
+        self, queries: Union[Collection[Tuple[str, str]], Tuple[str, str]]
+    ) -> torch.Tensor:
+        """
+        Accepts as input batch of [(s_i, bw_i)] where s_i is a prompt with an
+        abstract token (bw_i) representing a blank word and returns a distribution
+        over the vocabulary of the model.
+
+        :param `Iterable` queries: A batch of [(s_i, bw_i)] where s_i is a prompt with an abstract token (bw_i) representing a blank word
+
+        :return: Tensor contisting of log probabilities over vocab items.
+        """
+        if self.tokenizer.mask_token is None:
+            raise ValueError(
+                "Model does not have a mask token or a T5-like span-mask token."
+            )
+
+        if len(queries) == 0:
+            return torch.tensor([])
+
+        if isinstance(next(iter(queries)), str):
+            queries = [cast(Tuple[str, str], queries)]
+
+        prompts, words = zip(*queries)
+
+        # modified_prompts = self.add_special_tokens(prompts)
+        modified_prompts = self.tokenizer.batch_decode(
+            self.tokenizer(prompts)["input_ids"]
+        )
+        # splits = [prompt.split(word) for prompt, word in zip(modified_prompts, words)]
+        splits = [
+            re.split(rf"\b{word}\b", prompt)
+            for prompt, word in zip(modified_prompts, words)
+        ]
+        splits = [[x.strip() for x in s] for s in splits]
+        pre, post = list(zip(*splits))
+        pre_idx = self.tokenizer(list(pre), add_special_tokens=False, padding=False)[
+            "input_ids"
+        ]
+
+        if self.model.config.model_type == "t5":
+            mask_idx = [1 for _ in pre_idx]
+        else:
+            mask_idx = [len(item) for item in pre_idx]
+
+        masked = [
+            re.sub(rf"\b{w}\b", self.tokenizer.mask_token, m)
+            for m, w in zip(prompts, words)
+        ]
+
+        decoder_input = [
+            self.tokenizer.decode(self.model.config.decoder_start_token_id)
+            + " "
+            + self.tokenizer.mask_token
+            for _ in range(len(masked))
+        ]
+
+        with torch.no_grad():
+            # encoded = self.tokenizer(
+            #     masked, add_special_tokens=False, return_tensors="pt", padding=True
+            # )
+            encoded = self.tokenizer(masked, return_tensors="pt", padding=True)
+            decoder_input_ids = self.tokenizer(
+                decoder_input, return_tensors="pt", add_special_tokens=False
+            ).input_ids
+
+            if self.device != "auto":
+                encoded = encoded.to(self.device)
+                decoder_input_ids = decoder_input_ids.to(self.device)
+
+            logits = self.model(**encoded, decoder_input_ids=decoder_input_ids)
+            presoftmax = logits.logits[torch.arange(len(queries)), mask_idx]
+            if "cuda" in self.device or "auto" in self.device:
+                presoftmax = presoftmax.detach().cpu()
+            else:
+                presoftmax = presoftmax.detach()
+
+        logprobs = presoftmax - presoftmax.logsumexp(1).unsqueeze(1)
+
+        return logprobs
 
     def compute_conditional_stats(
         self,
@@ -2924,7 +3013,9 @@ class MambaScorer(LMScorer):
         if self.tokenizer.chat_template is None:
             encoded = self.tokenizer(text, return_tensors="pt", padding=True)
         else:
-            encoded = self.tokenizer(text, return_tensors="pt", padding=True, add_special_tokens=False)
+            encoded = self.tokenizer(
+                text, return_tensors="pt", padding=True, add_special_tokens=False
+            )
         if "token_type_ids" in encoded.keys():
             encoded.pop("token_type_ids")
 
@@ -2956,7 +3047,7 @@ class MambaScorer(LMScorer):
         self,
         preamble: Union[str, List[str]],
         stimuli: Union[str, List[str]],
-        separator: Union[str, List[str]]=" ",
+        separator: Union[str, List[str]] = " ",
         bos_token=False,
         eos_token=False,
     ) -> Tuple:
@@ -2992,12 +3083,14 @@ class MambaScorer(LMScorer):
                 if isinstance(preamble, str)
                 else [p + separator + s for p, s in list(zip(preamble, stimuli))]
             )
-            
+
         elif isinstance(separator, list):
             assert not isinstance(preamble, str)
             assert len(preamble) == len(separator) == len(stimuli)
-            
-            sentences = [p + sep + s for p, sep, s in list(zip(preamble, separator, stimuli))]
+
+            sentences = [
+                p + sep + s for p, sep, s in list(zip(preamble, separator, stimuli))
+            ]
 
         return self.encode(sentences, bos_token, eos_token), preamble_lens
 
@@ -3577,7 +3670,7 @@ class VLMScorer(LMScorer):
         preamble: Union[str, List[str]],
         stimuli: Union[str, List[str]],
         image=None,
-        separator: Union[str, List[str]]=" ",
+        separator: Union[str, List[str]] = " ",
     ) -> Tuple:
         """
         Prepares a batch of input text into a format fit to run LM
@@ -3609,12 +3702,14 @@ class VLMScorer(LMScorer):
                 if isinstance(preamble, str)
                 else [p + separator + s for p, s in list(zip(preamble, stimuli))]
             )
-            
+
         elif isinstance(separator, list):
             assert not isinstance(preamble, str)
             assert len(preamble) == len(separator) == len(stimuli)
-            
-            sentences = [p + sep + s for p, sep, s in list(zip(preamble, separator, stimuli))]
+
+            sentences = [
+                p + sep + s for p, sep, s in list(zip(preamble, separator, stimuli))
+            ]
 
         return self.encode(sentences, image), preamble_lens
 
