@@ -1375,6 +1375,7 @@ class IncrementalLMScorer(LMScorer):
         model: Union[str, torch.nn.Module],
         device: Optional[str] = "cpu",
         tokenizer=None,
+        is_chat=False,
         **kwargs,
     ) -> None:
         """
@@ -1392,7 +1393,7 @@ class IncrementalLMScorer(LMScorer):
         super(IncrementalLMScorer, self).__init__(
             model, device=device, tokenizer=tokenizer, **kwargs
         )
-
+        self.is_chat = is_chat
         if isinstance(model, str):
             if self.device == "auto":
                 self.model = AutoModelForCausalLM.from_pretrained(
@@ -1512,7 +1513,7 @@ class IncrementalLMScorer(LMScorer):
 
         text = [text] if isinstance(text, str) else text
         text = [_format(self, t, bos_token, eos_token) for t in text]
-        if self.tokenizer.chat_template is None:
+        if not self.is_chat:
             encoded = self.tokenizer(text, return_tensors="pt", padding=True)
         else:
             encoded = self.tokenizer(
